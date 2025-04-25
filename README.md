@@ -61,7 +61,7 @@ Easily schedule and send reminders—including text, images, videos, voice notes
 
 2. **Clone & Setup**
     ```bash
-    git clone https://github.com/YourUserName/TelegramReminder
+    git clone https://github.com/Oliviertjeh/TelegramReminder
     cd TelegramReminder
     python3 -m venv .venv/TGreminder
     source .venv/TGreminder/bin/activate
