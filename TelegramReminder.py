@@ -153,7 +153,7 @@ async def handler(ev):
 async def help_handler(ev):
     """Send the available commands help text."""
     help_text = """**Available commands:**
-/add reminder   – create a new reminder
+/add reminder date time message – create a new reminder
 /list reminders – list active reminders
 /delete reminder <ID> – remove a reminder by its ID
 """
