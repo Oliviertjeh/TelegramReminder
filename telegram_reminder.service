@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Reminder Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/TGreminder
+ExecStart=/usr/bin/bash -lc 'source /home/pi/TGreminder/.venv/TGReminder/bin/activate && exec python /home/pi/TGreminder/TelegramReminder_autorun.py'
+Restart=always
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
