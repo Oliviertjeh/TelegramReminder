@@ -65,7 +65,6 @@ Easily schedule and send reminders—including text, images, videos, voice notes
     cd TelegramReminder
     python3 -m venv .venv/TGreminder
     source .venv/TGreminder/bin/activate
-    pip install -r requirements.txt
     ```
 
 3. **Configure**
