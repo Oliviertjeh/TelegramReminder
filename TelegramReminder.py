@@ -470,25 +470,15 @@ async def delete_handler(ev):
 # ─── HELP ─────────────────────────────────────────────────────────────────────
 @client.on(events.NewMessage(pattern=CMD_HELP))
 async def help_handler(ev):
-    """Sends the available commands help text."""
+    """Send the available commands help text."""
     if not await is_allowed(ev): return
     help_text = """**Available commands:**
 
-🗓️ `/add reminder <date/time info> <text>`
-   _Create a new reminder. Attach/reply to media to include it._
-   _Examples:_
-   `/add reminder tomorrow 9am Check backup`
-   `/add reminder 31-12 23:59 Happy New Year!`
-   `/add reminder next friday 17:00 Team meeting`
+🗓️ `/add reminder date time message` – create a new reminder
 
-📋 `/list reminders` or `/list`
-   _List your upcoming scheduled reminders._
+📋 `/list reminders` – list active reminders
 
-🗑️ `/delete reminder <ID>` or `/del reminder <ID>`
-   _Remove the reminder with the specified ID (use /list to find IDs)._
-
-❓ `/help reminder` or `/help`
-   _Show this help message._
+🗑️ `/delete reminder <ID>` – remove a reminder by its ID
 """
     await ev.reply(help_text, parse_mode="md")
 
