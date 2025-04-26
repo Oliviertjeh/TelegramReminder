@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+reminder_userbot.py – Telegram reminder helper under a *user* account.
+
+🔄 *2024-07-28*: Various fixes and media handling improvements.
+🔄 *2024-07-28*: Reverted to force download/upload for scheduled media.
+🔄 *2024-07-28*: Fixed multiple SyntaxErrors in list_handler cleanup.
+🔄 *2024-07-28*: Combine command text and original replied text for reminder.
+🔄 *2024-07-28*: Simplified confirmation msg; Remove forward simulation.
+🔄 *2024-07-28*: Restructure /list output format, adjust bolding.
+"""
 import os
 import re
 import sys
@@ -216,7 +226,7 @@ async def add_handler(ev):
         if reply_msg:
              source_message = reply_msg; media_source_info = f"from reply {reply_msg.id}"
              original_text = reply_msg.text; print(f"[DEBUG add] Original text: '{original_text[:100]}...'")
-             # No more forward check
+             # No forward check needed now
         else: print("[DEBUG add] Reply message object not found.")
     if source_message: print(f"[DEBUG add] Found source message {media_source_info}")
     else: print("[DEBUG add] No source message identified.")
@@ -310,28 +320,27 @@ async def list_handler(ev):
 
     for r in active_reminders:
         try:
-            # Reminder Header (Bold ID, Italic ID number)
-            message_parts.append(f"**🗓️ *ID {r.get('id', '?')}***")
+            # Reminder Header (Bold ID and Number)
+            message_parts.append(f"**🗓️ ID {r.get('id', '?')}**") # <<< Bold ID, no italics
 
-            # Date Line
+            # Date Line (Bold Label)
             when_local = datetime.fromisoformat(r["time"]).astimezone(TZ)
             time_str = when_local.strftime('%d-%m-%Y %H:%M %Z')
-            message_parts.append(f"   • Date: {time_str}")
+            message_parts.append(f"   • **Date:** {time_str}") # <<< Bold label
 
-            # Reminder Text Line
+            # Reminder Text Line (Bold Label)
             caption = r.get('caption', '').strip()
             if not caption:
-                reminder_text = "_(no description provided)_" # Italic placeholder
+                reminder_text = "_(no description provided)_" # Keep italics for placeholder
             else:
-                # Clean potential markdown and truncate
                 caption_clean = caption.replace('_', '').replace('*', '').replace('`','')
                 max_caption_len = 70
                 if len(caption_clean) > max_caption_len:
                     caption_clean = caption_clean[:max_caption_len-1] + "…"
-                reminder_text = caption_clean # Plain text
-            message_parts.append(f"   • Reminder: {reminder_text}")
+                reminder_text = caption_clean
+            message_parts.append(f"   • **Reminder:** {reminder_text}") # <<< Bold label
 
-            # Creator Line
+            # Creator Line (Bold Label)
             creator_name = f"ID {r.get('user_id', 'Unknown')}" # Default
             user_id = r.get('user_id')
             if user_id:
@@ -345,18 +354,19 @@ async def list_handler(ev):
                     username = getattr(user_entity, 'username', None)
                     first_name = getattr(user_entity, 'first_name', None)
                     if username:
-                        creator_name = username # <<< Use username without @
+                        creator_name = username # No '@'
                     elif first_name:
                         creator_name = first_name
-            message_parts.append(f"   • By: {creator_name}") # Plain text name/username
+            message_parts.append(f"   • **By:** {creator_name}") # <<< Bold label
 
             # Add a blank line for separation
             message_parts.append("")
 
         except Exception as e:
             print(f"Err format id={r.get('id','?')}: {e}");
-            message_parts.append(f"**🗓️ *ID {r.get('id','?')}***")
-            message_parts.append("   • Error formatting this reminder.")
+            # Add error line in the new format
+            message_parts.append(f"**🗓️ ID {r.get('id','?')}**") # Bold ID
+            message_parts.append("   • **Error:** formatting this reminder.") # Bold label
             message_parts.append("")
 
 
@@ -399,7 +409,6 @@ async def delete_handler(ev):
 @client.on(events.NewMessage(pattern=CMD_HELP))
 async def help_handler(ev):
     if not await is_allowed(ev): return
-    # Updated help text to reflect list format changes
     help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying, includes original text & media.\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders in detailed format, including creator.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
     await ev.reply(help_text, parse_mode="md")
 
