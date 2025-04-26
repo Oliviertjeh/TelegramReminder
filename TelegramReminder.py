@@ -96,7 +96,6 @@ next_id = max([r.get("id", 0) for r in reminders], default=0) + 1
 print(f"ℹ️ Next reminder ID: {next_id}")
 
 def save_reminders():
-    # Ensure user_id is saved if present, otherwise skip (handle potential old format)
     valid_reminders = [r for r in reminders if isinstance(r, dict) and all(k in r for k in ['id', 'chat_id', 'scheduled_id', 'time'])]
     print(f"💾 Saving {len(valid_reminders)} reminders...")
     try:
@@ -138,10 +137,8 @@ async def schedule_reminder(ev, when: datetime, caption: str,
     try:
         when_local_debug = when.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
         schedule_method = "text only"
-        if media_path:
-            schedule_method = f"uploading from '{media_path}'"
-
-        print(f"[DEBUG schedule] Attempting schedule for chat={ev.chat_id}, time_local={when_local_debug}, method={schedule_method}, text='{text[:100]}...'")
+        if media_path: schedule_method = f"uploading from '{media_path}'"
+        print(f"[DEBUG schedule] Attempting schedule: chat={ev.chat_id}, time={when_local_debug}, method={schedule_method}, text='{text[:100]}...'")
 
         if media_path:
             print(f"[DEBUG schedule] Calling send_file with file=media_path")
@@ -150,27 +147,22 @@ async def schedule_reminder(ev, when: datetime, caption: str,
              print(f"[DEBUG schedule] Calling send_message (no media)")
              msg = await client.send_message(ev.chat_id, text, schedule=when, parse_mode="md")
 
-        if msg:
-            print(f"[DEBUG schedule] API call OK, msg_id={msg.id}.") # Simplified verification log
-        else:
-             raise ValueError("Scheduling API call did not return message object.")
+        if msg: print(f"[DEBUG schedule] API call OK, msg_id={msg.id}.")
+        else: raise ValueError("Scheduling API call did not return message object.")
 
     except Exception as e:
-        print(f"❌ Failed to schedule message in chat {ev.chat_id}: {e}")
-        import traceback; traceback.print_exc()
+        print(f"❌ Failed to schedule message: {e}"); import traceback; traceback.print_exc()
         await ev.reply(f"❌ Failed to schedule message via API: {type(e).__name__}")
         if tmp_dir_to_clean: shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
         return None
     finally:
-        if tmp_dir_to_clean:
-            print(f"[DEBUG schedule] Cleaning tmp dir: {tmp_dir_to_clean}")
-            shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
+        if tmp_dir_to_clean: print(f"[DEBUG schedule] Cleaning tmp dir: {tmp_dir_to_clean}"); shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
 
     # --- Store Reminder ---
     current_id = next_id
     reminder = {
         "id": current_id, "chat_id": ev.chat_id, "scheduled_id": msg.id,
-        "time": when.isoformat(), "caption": caption, "user_id": sender.id, # Ensure user_id is stored
+        "time": when.isoformat(), "caption": caption, "user_id": sender.id,
         "media_info": {"method": "upload" if media_path else "none"}
     }
     reminders.append(reminder); save_reminders()
@@ -181,7 +173,7 @@ async def schedule_reminder(ev, when: datetime, caption: str,
 # ─── UTILITY: Check Chat Permission ────────────────────────────────────────────
 async def is_allowed(ev):
     if not ALLOWED_CHATS: return True
-    chat_id = ev.chat_id # Assign before use
+    chat_id = ev.chat_id
     if chat_id in ALLOWED_CHATS: return True
     try: chat = await ev.get_chat(); uname = getattr(chat, "username", None)
     except Exception as e: print(f"ℹ️ Could not get username for {chat_id}: {e}"); uname = None
@@ -214,9 +206,9 @@ async def add_handler(ev):
     now = datetime.now(timezone.utc); min_future_delta = timedelta(seconds=5)
     if parsed_dt_utc <= now + min_future_delta: await ev.reply("⏳ Time is past/too soon!"); return
 
-    # --- Media handling, Original Text, and Forward Info ---
+    # --- Media handling & Get Original Text ---
     media_path = None; tmp_dir = None; source_message = None; media_source_info = ""
-    media_acquired = False; original_text = None; forward_info_text = ""
+    media_acquired = False; original_text = None
 
     if ev.media: source_message = ev; media_source_info = "from command msg"
     elif ev.is_reply:
@@ -224,20 +216,7 @@ async def add_handler(ev):
         if reply_msg:
              source_message = reply_msg; media_source_info = f"from reply {reply_msg.id}"
              original_text = reply_msg.text; print(f"[DEBUG add] Original text: '{original_text[:100]}...'")
-             # Check for Forward
-             if reply_msg.fwd_from:
-                 print("[DEBUG add] Detected forwarded message.")
-                 fwd_header = reply_msg.fwd_from; sender_name = None
-                 try:
-                     fwd_peer_id = getattr(fwd_header, 'from_id', None) or getattr(fwd_header, 'saved_from_peer', None)
-                     if fwd_peer_id:
-                         entity = await client.get_entity(fwd_peer_id)
-                         sender_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or f"{getattr(entity, 'first_name', '')} {getattr(entity, 'last_name', '')}".strip()
-                         if getattr(entity, 'username', None): sender_name = f"@{sender_name}" # Add @ for usernames
-                     elif hasattr(fwd_header, 'from_name') and fwd_header.from_name: sender_name = fwd_header.from_name
-                     if sender_name: forward_info_text = f"(Forwarded from: {sender_name})"; print(f"[DEBUG add] {forward_info_text}")
-                     else: forward_info_text = "(Forwarded)"
-                 except Exception as e: print(f"⚠️ Could not resolve fwd source: {e}"); forward_info_text = "(Forwarded)"
+             # No more forward check
         else: print("[DEBUG add] Reply message object not found.")
     if source_message: print(f"[DEBUG add] Found source message {media_source_info}")
     else: print("[DEBUG add] No source message identified.")
@@ -256,14 +235,13 @@ async def add_handler(ev):
              media_path = None; media_acquired = False
              if tmp_dir: shutil.rmtree(tmp_dir, ignore_errors=True); print(f"[DEBUG media] Cleaned tmp dir {tmp_dir} after DL error."); tmp_dir = None
 
-    # --- Combine Captions ---
+    # --- Combine Captions (No Forwarding) ---
     final_caption = command_caption or ""; original_text_str = original_text or ""
     if original_text_str and original_text_str.strip() != final_caption.strip():
         separator = "\n\n---\n" if final_caption else ""
         final_caption = f"{final_caption}{separator}{original_text_str}"; print("[DEBUG add] Appended original text.")
-    if forward_info_text: final_caption = f"{forward_info_text}\n{final_caption}".strip(); print("[DEBUG add] Prepended forward info.")
     if final_caption is None: final_caption = ""
-    print(f"[DEBUG add] Final caption: '{final_caption[:100]}...'")
+    print(f"[DEBUG add] Final caption for schedule: '{final_caption[:100]}...'")
 
     # --- Schedule ---
     local_id = await schedule_reminder(ev, parsed_dt_utc, final_caption, media_path=media_path, tmp_dir_to_clean=tmp_dir)
@@ -284,7 +262,8 @@ async def list_handler(ev):
     valid_reminders_local = []
     needs_resave = False
 
-    for r in list(reminders): # Iterate copy
+    # --- Cleanup Logic ---
+    for r in list(reminders):
          if not (isinstance(r, dict) and all(k in r for k in ['id','chat_id','scheduled_id','time'])):
              print(f"⚠️ Removing invalid structure: {r}"); needs_resave = True
              try: reminders.remove(r)
@@ -294,7 +273,7 @@ async def list_handler(ev):
              r_time_utc = datetime.fromisoformat(r["time"])
              if r_time_utc.tzinfo is None:
                 print(f"⚠️ ID {r.get('id')}: naive datetime, assuming UTC."); r_time_utc = r_time_utc.replace(tzinfo=timezone.utc); needs_resave = True
-                updated = False; current_id = r.get('id') # Store ID before potentially losing 'r'
+                updated = False; current_id = r.get('id')
                 for i, item in enumerate(reminders):
                     if item.get("id") == current_id: reminders[i]["time"] = r_time_utc.isoformat(); updated = True; break
                 if not updated: print(f"    Warning: Could not find ID {current_id} to update time.")
@@ -309,81 +288,85 @@ async def list_handler(ev):
              except ValueError: print(f"    Info: Error item {r.get('id', '(no id)')} not found.")
              continue
     if needs_resave: print("ℹ️ Resaving reminders list after cleanup."); save_reminders()
+    # --- End Cleanup ---
 
     active_reminders = sorted(valid_reminders_local, key=lambda r: datetime.fromisoformat(r["time"]))
     if not active_reminders: await ev.reply("ℹ️ No upcoming reminders."); return
 
-    lines = ["**🗓️ Upcoming Reminders:**"]
-    max_caption_len = 60
-
-    # --- Pre-fetch user info ---
+    # --- User Info Fetch ---
     user_ids_needed = {r.get('user_id') for r in active_reminders if r.get('user_id')}
     user_info_cache = {}
     if user_ids_needed:
         print(f"[DEBUG list] Fetching info for user IDs: {user_ids_needed}")
         try:
-            # Using list comprehension for filtering None results if get_entity allows list input
             entities = await client.get_entity(list(user_ids_needed))
-            # Ensure entities is a list even if only one ID was passed
             if not isinstance(entities, list): entities = [entities]
             for user in entities:
                 if user: user_info_cache[user.id] = user
-        except Exception as fetch_err:
-             print(f"⚠️ Error pre-fetching user entities: {fetch_err}")
+        except Exception as fetch_err: print(f"⚠️ Error pre-fetching users: {fetch_err}")
 
-    # --- Format each line ---
+    # --- Build Formatted Message ---
+    message_parts = ["**🗓️ Upcoming Reminders:**\n"] # Start with bold title
+
     for r in active_reminders:
         try:
+            # Reminder Header (Bold ID, Italic ID number)
+            message_parts.append(f"**🗓️ *ID {r.get('id', '?')}***")
+
+            # Date Line
             when_local = datetime.fromisoformat(r["time"]).astimezone(TZ)
-            time_str = when_local.strftime('%d-%m-%y %H:%M %Z')
-            caption_preview = r.get('caption', 'No text')
-            media_indicator = ""
+            time_str = when_local.strftime('%d-%m-%Y %H:%M %Z')
+            message_parts.append(f"   • Date: {time_str}")
 
-            if len(caption_preview) > max_caption_len:
-                caption_preview = caption_preview[:max_caption_len-3].replace('\n',' ') + "..."
-            if r.get('media_info', {}).get('method') == 'upload':
-                media_indicator = " 🖼️"
+            # Reminder Text Line
+            caption = r.get('caption', '').strip()
+            if not caption:
+                reminder_text = "_(no description provided)_" # Italic placeholder
+            else:
+                # Clean potential markdown and truncate
+                caption_clean = caption.replace('_', '').replace('*', '').replace('`','')
+                max_caption_len = 70
+                if len(caption_clean) > max_caption_len:
+                    caption_clean = caption_clean[:max_caption_len-1] + "…"
+                reminder_text = caption_clean # Plain text
+            message_parts.append(f"   • Reminder: {reminder_text}")
 
-            # --- Get Creator Info ---
-            creator_info_str = ""
+            # Creator Line
+            creator_name = f"ID {r.get('user_id', 'Unknown')}" # Default
             user_id = r.get('user_id')
             if user_id:
                 user_entity = user_info_cache.get(user_id)
-                if not user_entity and user_id not in user_info_cache: # Fetch only if not cached (even if cache value is None)
+                if not user_entity and user_id not in user_info_cache:
                     try:
-                        print(f"    Fetching entity individually for ID {user_id}")
-                        user_entity = await client.get_entity(user_id)
-                        user_info_cache[user_id] = user_entity # Cache result (even if None)
-                    except Exception as user_err:
-                         print(f"    Warn: Could not get entity for user ID {user_id}: {user_err}")
-                         user_info_cache[user_id] = None # Cache failure as None
+                        user_entity = await client.get_entity(user_id); user_info_cache[user_id] = user_entity
+                    except Exception: user_info_cache[user_id] = None
 
-                # Format name from entity if found
                 if user_entity:
                     username = getattr(user_entity, 'username', None)
                     first_name = getattr(user_entity, 'first_name', None)
                     if username:
-                        creator_info_str = f"(by @{username})"
+                        creator_name = username # <<< Use username without @
                     elif first_name:
-                        creator_info_str = f"(by {first_name})"
-                    else:
-                        creator_info_str = f"(by ID {user_id})"
-                else:
-                    creator_info_str = f"(by ID {user_id})" # Fallback if entity fetch failed or user deleted
-            # --- End Creator Info ---
+                        creator_name = first_name
+            message_parts.append(f"   • By: {creator_name}") # Plain text name/username
 
-            lines.append(f" • ID **{r.get('id', '?')}**: `{time_str}` - _{caption_preview}_{media_indicator} {creator_info_str}")
+            # Add a blank line for separation
+            message_parts.append("")
 
         except Exception as e:
             print(f"Err format id={r.get('id','?')}: {e}");
-            lines.append(f" • ID {r.get('id','?')}: Error formatting.")
+            message_parts.append(f"**🗓️ *ID {r.get('id','?')}***")
+            message_parts.append("   • Error formatting this reminder.")
+            message_parts.append("")
+
 
     # --- Send the message ---
-    message_text = "\n".join(lines)
-    if len(message_text) > 4096:
-        max_lines = 4096 // 80
-        message_text = "\n".join(lines[:max_lines]) + f"\n\n... ({len(active_reminders) - max_lines + 1} more)"
-    await ev.reply(message_text, parse_mode="md")
+    final_message = "\n".join(message_parts).strip()
+
+    if len(final_message) > 4096:
+        final_message = final_message[:4050] + "\n\n... (list truncated)"
+
+    await ev.reply(final_message, parse_mode="md")
 
 
 @client.on(events.NewMessage(pattern=CMD_DEL))
@@ -416,7 +399,8 @@ async def delete_handler(ev):
 @client.on(events.NewMessage(pattern=CMD_HELP))
 async def help_handler(ev):
     if not await is_allowed(ev): return
-    help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying to a msg, includes its text & media. If reply is a forward, adds "(Forwarded from...)".\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders. 🖼️=media. Shows creator.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
+    # Updated help text to reflect list format changes
+    help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying, includes original text & media.\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders in detailed format, including creator.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
     await ev.reply(help_text, parse_mode="md")
 
 # ─── RUN LOOP / MAIN FUNCTION ──────────────────────────────────────────────────
