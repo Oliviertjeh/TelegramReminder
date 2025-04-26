@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-reminder_userbot.py – Telegram reminder helper under a *user* account.
-
-🔄 *2024-07-28*: Various fixes and media handling improvements.
-🔄 *2024-07-28*: Reverted to force download/upload for scheduled media.
-🔄 *2024-07-28*: Fixed multiple SyntaxErrors in list_handler cleanup.
-🔄 *2024-07-28*: Combine command text and original replied text for reminder.
-🔄 *2024-07-28*: Simplified confirmation msg; Remove forward simulation.
-🔄 *2024-07-28*: Restructure /list output format, adjust bolding.
-"""
 import os
 import re
 import sys
