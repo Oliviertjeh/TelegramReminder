@@ -306,7 +306,7 @@ async def list_handler(ev):
         except Exception as fetch_err: print(f"⚠️ Error pre-fetching users: {fetch_err}")
 
     # --- Build Formatted Message ---
-    message_parts = ["**🗓️ Upcoming Reminders:**\n"] # Start with bold title
+    message_parts = ["**Upcoming Reminders:**\n"] # Start with bold title
 
     for r in active_reminders:
         try:
