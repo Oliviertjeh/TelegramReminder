@@ -96,6 +96,7 @@ next_id = max([r.get("id", 0) for r in reminders], default=0) + 1
 print(f"ℹ️ Next reminder ID: {next_id}")
 
 def save_reminders():
+    # Ensure user_id is saved if present, otherwise skip (handle potential old format)
     valid_reminders = [r for r in reminders if isinstance(r, dict) and all(k in r for k in ['id', 'chat_id', 'scheduled_id', 'time'])]
     print(f"💾 Saving {len(valid_reminders)} reminders...")
     try:
@@ -125,7 +126,6 @@ async def schedule_reminder(ev, when: datetime, caption: str,
         print(f"❌ Internal Error: schedule_reminder needs UTC datetime"); await ev.reply("❌ Internal error (time)."); return None
 
     sender = await ev.get_sender(); mention = f"[{sender.first_name or 'User'}](tg://user?id={sender.id})"
-    # Use the full caption passed from add_handler
     text = f"⏰ {mention}: {caption}" if caption else f"⏰ Reminder for {mention}"
 
     now = datetime.now(timezone.utc); min_schedule_delay = timedelta(seconds=10)
@@ -143,33 +143,15 @@ async def schedule_reminder(ev, when: datetime, caption: str,
 
         print(f"[DEBUG schedule] Attempting schedule for chat={ev.chat_id}, time_local={when_local_debug}, method={schedule_method}, text='{text[:100]}...'")
 
-        # --- Send based on media_path ---
-        if media_path: # If we have a downloaded path
+        if media_path:
             print(f"[DEBUG schedule] Calling send_file with file=media_path")
-            msg = await client.send_file(
-                ev.chat_id,
-                file=media_path, # Use downloaded path
-                caption=text,    # Use the combined text here
-                schedule=when,
-                parse_mode="md"
-            )
+            msg = await client.send_file(ev.chat_id, file=media_path, caption=text, schedule=when, parse_mode="md")
         else:
              print(f"[DEBUG schedule] Calling send_message (no media)")
              msg = await client.send_message(ev.chat_id, text, schedule=when, parse_mode="md")
 
-        # --- Verification ---
         if msg:
-            print(f"[DEBUG schedule] API call OK, msg_id={msg.id}. Verifying media...")
-            has_media = bool(getattr(msg, 'media', None))
-            expected_media = bool(media_path) # Expect media if path was provided
-            if expected_media and not has_media:
-                print(f"    ⚠️ WARNING: Media was scheduled (method={schedule_method}), but result msg lacks media!")
-            elif not expected_media and has_media:
-                 print(f"    ⚠️ WARNING: Text only was scheduled, but result msg HAS media?")
-            elif expected_media and has_media:
-                 print(f"    ✅ Result message appears to have media as expected.")
-            else: # Not expected, not present
-                 print(f"    ✅ Result message is text-only as expected.")
+            print(f"[DEBUG schedule] API call OK, msg_id={msg.id}.") # Simplified verification log
         else:
              raise ValueError("Scheduling API call did not return message object.")
 
@@ -180,17 +162,15 @@ async def schedule_reminder(ev, when: datetime, caption: str,
         if tmp_dir_to_clean: shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
         return None
     finally:
-        # Cleanup tmp dir if it exists
         if tmp_dir_to_clean:
             print(f"[DEBUG schedule] Cleaning tmp dir: {tmp_dir_to_clean}")
             shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
 
     # --- Store Reminder ---
     current_id = next_id
-    # Store the combined caption used for scheduling
     reminder = {
         "id": current_id, "chat_id": ev.chat_id, "scheduled_id": msg.id,
-        "time": when.isoformat(), "caption": caption, "user_id": sender.id,
+        "time": when.isoformat(), "caption": caption, "user_id": sender.id, # Ensure user_id is stored
         "media_info": {"method": "upload" if media_path else "none"}
     }
     reminders.append(reminder); save_reminders()
@@ -225,8 +205,7 @@ async def add_handler(ev):
         temp_dt = parse_dt(potential_date_str)
         if temp_dt: parsed_dt_utc = temp_dt; successful_parse_index = i
         elif successful_parse_index != -1: break
-    if successful_parse_index != -1:
-        command_caption = " ".join(tokens[successful_parse_index:]).strip()
+    if successful_parse_index != -1: command_caption = " ".join(tokens[successful_parse_index:]).strip()
     else: parsed_dt_utc = None
     if not parsed_dt_utc: await ev.reply("❌ Couldn't parse date/time."); return
     print(f"[DEBUG add] Parsed: time_utc='{parsed_dt_utc}', command_caption='{command_caption}'")
@@ -235,34 +214,42 @@ async def add_handler(ev):
     now = datetime.now(timezone.utc); min_future_delta = timedelta(seconds=5)
     if parsed_dt_utc <= now + min_future_delta: await ev.reply("⏳ Time is past/too soon!"); return
 
-    # --- Media handling (Force Download) & Get Original Text ---
+    # --- Media handling, Original Text, and Forward Info ---
     media_path = None; tmp_dir = None; source_message = None; media_source_info = ""
-    media_acquired = False
-    original_text = None
+    media_acquired = False; original_text = None; forward_info_text = ""
 
     if ev.media: source_message = ev; media_source_info = "from command msg"
     elif ev.is_reply:
         reply_msg = await ev.get_reply_message()
         if reply_msg:
-             source_message = reply_msg
-             media_source_info = f"from reply {reply_msg.id}"
-             original_text = reply_msg.text # Get text from reply
-             print(f"[DEBUG add] Original text from reply: '{original_text[:100]}...'")
+             source_message = reply_msg; media_source_info = f"from reply {reply_msg.id}"
+             original_text = reply_msg.text; print(f"[DEBUG add] Original text: '{original_text[:100]}...'")
+             # Check for Forward
+             if reply_msg.fwd_from:
+                 print("[DEBUG add] Detected forwarded message.")
+                 fwd_header = reply_msg.fwd_from; sender_name = None
+                 try:
+                     fwd_peer_id = getattr(fwd_header, 'from_id', None) or getattr(fwd_header, 'saved_from_peer', None)
+                     if fwd_peer_id:
+                         entity = await client.get_entity(fwd_peer_id)
+                         sender_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or f"{getattr(entity, 'first_name', '')} {getattr(entity, 'last_name', '')}".strip()
+                         if getattr(entity, 'username', None): sender_name = f"@{sender_name}" # Add @ for usernames
+                     elif hasattr(fwd_header, 'from_name') and fwd_header.from_name: sender_name = fwd_header.from_name
+                     if sender_name: forward_info_text = f"(Forwarded from: {sender_name})"; print(f"[DEBUG add] {forward_info_text}")
+                     else: forward_info_text = "(Forwarded)"
+                 except Exception as e: print(f"⚠️ Could not resolve fwd source: {e}"); forward_info_text = "(Forwarded)"
         else: print("[DEBUG add] Reply message object not found.")
-
-    if source_message: print(f"[DEBUG add] Found media source {media_source_info}")
+    if source_message: print(f"[DEBUG add] Found source message {media_source_info}")
     else: print("[DEBUG add] No source message identified.")
 
-    # --- Always attempt download if source message found AND has media ---
+    # --- Download ---
     if source_message and source_message.media:
          print(f"[DEBUG media] Attempting download {media_source_info}.")
          try:
              tmp_dir_path = Path(tempfile.mkdtemp(prefix="tgrem_media_")); tmp_dir = str(tmp_dir_path)
              print(f"[DEBUG media] Download target: {tmp_dir}")
              dl_path = await source_message.download_media(file=tmp_dir)
-             if dl_path and Path(dl_path).is_file():
-                  media_path = dl_path; media_acquired = True
-                  print(f"[DEBUG media] Download successful: {media_path}")
+             if dl_path and Path(dl_path).is_file(): media_path = dl_path; media_acquired = True; print(f"[DEBUG media] Download successful: {media_path}")
              else: print(f"⚠️ Download failed/invalid path: {dl_path}"); media_path = None; media_acquired = False
          except Exception as e:
              print(f"❌ Download failed: {e}"); await ev.reply(f"⚠️ Download failed {media_source_info}. Text only.")
@@ -270,37 +257,23 @@ async def add_handler(ev):
              if tmp_dir: shutil.rmtree(tmp_dir, ignore_errors=True); print(f"[DEBUG media] Cleaned tmp dir {tmp_dir} after DL error."); tmp_dir = None
 
     # --- Combine Captions ---
-    original_text_str = original_text or ""
-    final_caption = command_caption or "" # Ensure it's a string
-
-    if original_text_str:
-        if final_caption and final_caption.strip() != original_text_str.strip():
-            final_caption = f"{command_caption}\n\n---\n{original_text_str}"
-            print("[DEBUG add] Combined command caption and original text.")
-        elif not final_caption:
-             final_caption = original_text_str
-             print("[DEBUG add] Using original text as caption (no command caption).")
-
+    final_caption = command_caption or ""; original_text_str = original_text or ""
+    if original_text_str and original_text_str.strip() != final_caption.strip():
+        separator = "\n\n---\n" if final_caption else ""
+        final_caption = f"{final_caption}{separator}{original_text_str}"; print("[DEBUG add] Appended original text.")
+    if forward_info_text: final_caption = f"{forward_info_text}\n{final_caption}".strip(); print("[DEBUG add] Prepended forward info.")
     if final_caption is None: final_caption = ""
-    print(f"[DEBUG add] Final caption for schedule: '{final_caption[:100]}...'")
+    print(f"[DEBUG add] Final caption: '{final_caption[:100]}...'")
 
-    # --- Schedule (Pass combined caption) ---
-    local_id = await schedule_reminder(
-        ev, parsed_dt_utc, final_caption,
-        media_path=media_path,
-        tmp_dir_to_clean=tmp_dir
-    )
+    # --- Schedule ---
+    local_id = await schedule_reminder(ev, parsed_dt_utc, final_caption, media_path=media_path, tmp_dir_to_clean=tmp_dir)
 
     # --- Confirmation (Simplified) ---
     if local_id is not None:
         try:
             loc_dt_str = parsed_dt_utc.astimezone(TZ).strftime('%d-%m-%Y %H:%M %Z')
-            # Simplified confirmation message
             await ev.reply(f"✅ Reminder scheduled! (ID: {local_id})\nTime: **{loc_dt_str}**", parse_mode="md")
-        except Exception as e:
-             print(f"Error formatting confirmation: {e}")
-             # Fallback without time if formatting fails
-             await ev.reply(f"✅ Reminder scheduled! (ID: {local_id})", parse_mode="md")
+        except Exception as e: print(f"Error formatting confirmation: {e}"); await ev.reply(f"✅ Reminder scheduled! (ID: {local_id})", parse_mode="md")
 
 
 @client.on(events.NewMessage(pattern=CMD_LIST))
@@ -321,10 +294,10 @@ async def list_handler(ev):
              r_time_utc = datetime.fromisoformat(r["time"])
              if r_time_utc.tzinfo is None:
                 print(f"⚠️ ID {r.get('id')}: naive datetime, assuming UTC."); r_time_utc = r_time_utc.replace(tzinfo=timezone.utc); needs_resave = True
-                updated = False
+                updated = False; current_id = r.get('id') # Store ID before potentially losing 'r'
                 for i, item in enumerate(reminders):
-                    if item.get("id") == r.get("id"): reminders[i]["time"] = r_time_utc.isoformat(); updated = True; break
-                if not updated: print(f"    Warning: Could not find ID {r.get('id')} to update time.")
+                    if item.get("id") == current_id: reminders[i]["time"] = r_time_utc.isoformat(); updated = True; break
+                if not updated: print(f"    Warning: Could not find ID {current_id} to update time.")
              if r_time_utc > now: valid_reminders_local.append(r)
              else:
                  print(f"ℹ️ Removing past id={r.get('id')}"); needs_resave = True
@@ -336,20 +309,82 @@ async def list_handler(ev):
              except ValueError: print(f"    Info: Error item {r.get('id', '(no id)')} not found.")
              continue
     if needs_resave: print("ℹ️ Resaving reminders list after cleanup."); save_reminders()
+
     active_reminders = sorted(valid_reminders_local, key=lambda r: datetime.fromisoformat(r["time"]))
     if not active_reminders: await ev.reply("ℹ️ No upcoming reminders."); return
-    lines = ["**🗓️ Upcoming Reminders:**"]; max_caption_len = 60
+
+    lines = ["**🗓️ Upcoming Reminders:**"]
+    max_caption_len = 60
+
+    # --- Pre-fetch user info ---
+    user_ids_needed = {r.get('user_id') for r in active_reminders if r.get('user_id')}
+    user_info_cache = {}
+    if user_ids_needed:
+        print(f"[DEBUG list] Fetching info for user IDs: {user_ids_needed}")
+        try:
+            # Using list comprehension for filtering None results if get_entity allows list input
+            entities = await client.get_entity(list(user_ids_needed))
+            # Ensure entities is a list even if only one ID was passed
+            if not isinstance(entities, list): entities = [entities]
+            for user in entities:
+                if user: user_info_cache[user.id] = user
+        except Exception as fetch_err:
+             print(f"⚠️ Error pre-fetching user entities: {fetch_err}")
+
+    # --- Format each line ---
     for r in active_reminders:
         try:
-            when_local = datetime.fromisoformat(r["time"]).astimezone(TZ); time_str = when_local.strftime('%d-%m-%y %H:%M %Z')
-            caption_preview = r.get('caption', 'No text'); media_indicator = ""
-            if len(caption_preview) > max_caption_len: caption_preview = caption_preview[:max_caption_len-3].replace('\n',' ') + "..."
-            if r.get('media_info', {}).get('method') == 'upload': media_indicator = " 🖼️"
-            lines.append(f" • ID **{r.get('id', '?')}**: `{time_str}` - _{caption_preview}_{media_indicator}")
-        except Exception as e: print(f"Err format id={r.get('id','?')}: {e}"); lines.append(f" • ID {r.get('id','?')}: Error.")
+            when_local = datetime.fromisoformat(r["time"]).astimezone(TZ)
+            time_str = when_local.strftime('%d-%m-%y %H:%M %Z')
+            caption_preview = r.get('caption', 'No text')
+            media_indicator = ""
+
+            if len(caption_preview) > max_caption_len:
+                caption_preview = caption_preview[:max_caption_len-3].replace('\n',' ') + "..."
+            if r.get('media_info', {}).get('method') == 'upload':
+                media_indicator = " 🖼️"
+
+            # --- Get Creator Info ---
+            creator_info_str = ""
+            user_id = r.get('user_id')
+            if user_id:
+                user_entity = user_info_cache.get(user_id)
+                if not user_entity and user_id not in user_info_cache: # Fetch only if not cached (even if cache value is None)
+                    try:
+                        print(f"    Fetching entity individually for ID {user_id}")
+                        user_entity = await client.get_entity(user_id)
+                        user_info_cache[user_id] = user_entity # Cache result (even if None)
+                    except Exception as user_err:
+                         print(f"    Warn: Could not get entity for user ID {user_id}: {user_err}")
+                         user_info_cache[user_id] = None # Cache failure as None
+
+                # Format name from entity if found
+                if user_entity:
+                    username = getattr(user_entity, 'username', None)
+                    first_name = getattr(user_entity, 'first_name', None)
+                    if username:
+                        creator_info_str = f"(by @{username})"
+                    elif first_name:
+                        creator_info_str = f"(by {first_name})"
+                    else:
+                        creator_info_str = f"(by ID {user_id})"
+                else:
+                    creator_info_str = f"(by ID {user_id})" # Fallback if entity fetch failed or user deleted
+            # --- End Creator Info ---
+
+            lines.append(f" • ID **{r.get('id', '?')}**: `{time_str}` - _{caption_preview}_{media_indicator} {creator_info_str}")
+
+        except Exception as e:
+            print(f"Err format id={r.get('id','?')}: {e}");
+            lines.append(f" • ID {r.get('id','?')}: Error formatting.")
+
+    # --- Send the message ---
     message_text = "\n".join(lines)
-    if len(message_text) > 4096: max_lines = 4096 // 80; message_text = "\n".join(lines[:max_lines]) + f"\n\n... ({len(active_reminders) - max_lines + 1} more)"
+    if len(message_text) > 4096:
+        max_lines = 4096 // 80
+        message_text = "\n".join(lines[:max_lines]) + f"\n\n... ({len(active_reminders) - max_lines + 1} more)"
     await ev.reply(message_text, parse_mode="md")
+
 
 @client.on(events.NewMessage(pattern=CMD_DEL))
 async def delete_handler(ev):
@@ -381,7 +416,7 @@ async def delete_handler(ev):
 @client.on(events.NewMessage(pattern=CMD_HELP))
 async def help_handler(ev):
     if not await is_allowed(ev): return
-    help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying, includes original text & media.\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders. 🖼️=media.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
+    help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying to a msg, includes its text & media. If reply is a forward, adds "(Forwarded from...)".\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders. 🖼️=media. Shows creator.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
     await ev.reply(help_text, parse_mode="md")
 
 # ─── RUN LOOP / MAIN FUNCTION ──────────────────────────────────────────────────
