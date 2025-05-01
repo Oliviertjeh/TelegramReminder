@@ -78,7 +78,6 @@ Easily schedule and send reminders—including text, images, videos, voice notes
 
 4. **Run Manually**
     ```bash
-    source .venv/TGreminder/bin/activate
     pip install python-dotenv
     pip install python-dateutil
     python3 -m pip install --upgrade telethon
