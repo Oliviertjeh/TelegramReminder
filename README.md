@@ -65,6 +65,8 @@ Easily schedule and send reminders—including text, images, videos, voice notes
     cd TelegramReminder
     python3 -m venv .venv/TGreminder
     source .venv/TGreminder/bin/activate
+    sudo mkdir /home/pi/TelegramReminder/sessions
+    sudo chown pi:pi /home/pi/TelegramReminder/sessions
     ```
 
 3. **Configure**
