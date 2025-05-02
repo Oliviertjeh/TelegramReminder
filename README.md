@@ -1,37 +1,49 @@
-# Telegram Reminder Userbot [Working in 2025]
+# Telegram Reminder Bot [Working 2025]
 
-Easily schedule and send reminders—including text, images, videos, voice notes, and more—directly from your Telegram user account, using natural `/add reminder` commands and precise CEST/CET date handling.
+A versatile Telegram bot that allows you to schedule and manage reminders easily and directly within Telegram. You can send text-based reminders or include media like images and videos. The bot supports various date formats, timezones, and chat filtering for enhanced control and security.
 
 ---
 
-## Key Capabilities
+## Features
 
-- **Flexible Scheduling**  
-  Parse day‑first dates with optional times; defaults to 07:00 local if time is omitted.
+- **Flexible Scheduling**
+  - Ability to parse various date formats, including natural language input.
+  - Timezone support with automatic conversion to UTC.
+  - Defaults to 9:00 AM if no time is specified.
 
-- **Timezone Awareness**  
-  Built on `zoneinfo` and `dateutil` for unambiguous CEST/CET interpretation and automatic UTC conversion.
+- **Media and Text Support**
+  - Send reminders with attached media (images, videos, etc.).
+  - Send text-based reminders.
+  - Use text from replies as reminder captions.
+  - Link to the original message when replying.
+  - Media support can be toggled on/off based on directory permissions.
 
-- **Media Support**  
-  Remind with attached media by replying to a message or including file uploads—images, videos, voice notes, documents, etc.
+- **Chat Filtering**
+  - Restrict commands to specific chat IDs or usernames for enhanced security.
 
-- **Allowed‑Chats Filter**  
-  Restrict commands to one or more chat IDs or usernames for security and control.
+- **Commands**
+  - `/add <when> <msg>`: schedule a reminder.
+  - `/list`: list upcoming reminders.
+  - `/del <id>`: cancel a reminder by ID.
+  - `/help`: show available commands.
+  - `/start`: start bot message.
 
-- **Interactive Commands**  
-  - `/add reminder <date> [time] <text>` – schedule a new reminder
-  - `/list reminders` – list all upcoming scheduled reminders
-  - `/delete reminder <ID>` – cancel a reminder by its Telegram-assigned message ID
-  - `/help reminder` – show available commands
+- **Robust Error Handling and Logging**
+  - Detailed logging for debugging.
+  - Handles missing dependencies gracefully.
+  - Gracefully handle file errors.
 
-- **Debug Logging**  
-  Auto‑logs parse input vs. now comparison for easy troubleshooting.
+- **Systemd Integration**
+  - Designed for integration with systemd for automated background operation.
+
+- **Storage**
+  - Reminders are stored in a `reminders.json` file.
 
 ---
 
 ## How It Works
 
-1. **Initialization**  
+1. **Initialization**
    On first run, the script loads or prompts for your `TG_API_ID`, `TG_API_HASH`, and optional `ALLOWED_CHATS` list, saving them to a `.env` file.
 
 2. **Parsing & Validation**  
@@ -39,11 +51,11 @@ Easily schedule and send reminders—including text, images, videos, voice notes
 
 3. **Scheduling**  
    Calls Telethon’s `send_message` or `send_file` with the `schedule=` argument in UTC, so Telegram handles delivery at the precise moment.
-
-4. **Media Handling**  
-   Downloads reply‑or‑attached media into a temp folder, schedules sending the file, then cleans up.
-
-5. **Systemd Integration**  
+   
+4. **Media Handling**
+  Downloads reply‑or‑attached media into the `media` folder, schedules sending the file.
+   
+5. **Systemd Integration**
    Exposes an `async def main()` entrypoint for headless launch under systemd or other init systems.
 
 6. **Commands & Help**  
@@ -51,9 +63,9 @@ Easily schedule and send reminders—including text, images, videos, voice notes
 
 ---
 
-## Installation & Usage
+## Installation
 
-1. **System Prep**
+1. **System Preparation**
     ```bash
     sudo apt update && sudo apt upgrade -y
     sudo apt install git python3-venv python3-pip -y
