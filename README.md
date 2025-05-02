@@ -94,15 +94,15 @@ Easily schedule and send reminders—including text, images, videos, voice notes
       [Unit]
       Description=Telegram Reminder Service
       After=network.target
-
+      
       [Service]
       Type=simple
       User=pi
-      WorkingDirectory=/home/pi/TGreminder
-      EnvironmentFile=/home/pi/TGreminder/.env
-      ExecStart=/home/pi/TGreminder/.venv/TGreminder/bin/python /home/pi/TGreminder/TelegramReminder_autorun.py
+      WorkingDirectory=/home/pi/TelegramReminder
+      EnvironmentFile=/home/pi/TelegramReminder/.env
+      ExecStart=/home/pi/TelegramReminder/.venv/TGreminder/bin/python /home/pi/TelegramReminder/TelegramReminder_autorun.py
       Restart=on-failure
-
+      
       [Install]
       WantedBy=multi-user.target
       ```
