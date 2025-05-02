@@ -67,6 +67,8 @@ Easily schedule and send reminders—including text, images, videos, voice notes
     source .venv/TGreminder/bin/activate
     sudo mkdir /home/pi/TelegramReminder/sessions
     sudo chown pi:pi /home/pi/TelegramReminder/sessions
+    sudo nano reminders.json
+    sudo chmod u+rw reminders.json
     ```
 
 3. **Configure**
