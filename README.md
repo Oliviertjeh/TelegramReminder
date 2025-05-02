@@ -22,11 +22,10 @@ A versatile Telegram bot that allows you to schedule and manage reminders easily
   - Restrict commands to specific chat IDs or usernames for enhanced security.
 
 - **Commands**
-  - `/add <when> <msg>`: schedule a reminder.
-  - `/list`: list upcoming reminders.
-  - `/del <id>`: cancel a reminder by ID.
-  - `/help`: show available commands.
-  - `/start`: start bot message.
+  - `/add_reminder <when> <msg>`: schedule a reminder.
+  - `/list_reminders`: list upcoming reminders.
+  - `/delete_reminder <id>`: cancel a reminder by ID.
+  - `/help_reminder`: show available commands.
 
 - **Robust Error Handling and Logging**
   - Detailed logging for debugging.
