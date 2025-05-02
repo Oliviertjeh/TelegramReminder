@@ -1,421 +1,421 @@
 #!/usr/bin/env python3
-import os
-import re
-import sys
-import json
-import tempfile
-import shutil
-import asyncio
+"""Telegram Reminder Bot — single‑file version.
+
+Features
+========
+* `/add_reminder <when> <msg>` — stores a reminder (media supported if the bot can write `media/`).
+                                 If replying to a message without providing <msg>, uses replied text.
+* `/list_reminders`             — list upcoming reminders for the chat.
+* `/delete_reminder <id>`       — delete by id.
+* `/help`                       — show help.
+
+Times are interpreted in the timezone configured with the `TIMEZONE` env‑var
+(default *Europe/Amsterdam*).  If **no explicit time** is in the phrase, the
+bot assumes **09:00** in the given date. Reminder includes link to original message if added via reply.
+
+Environment variables required in `.env` (in the same folder as the script):
+--------------------------------------------------------------------------
+TG_API_ID=<integer>
+TG_API_HASH=<string>
+TG_BOT_TOKEN=<token>
+# optional
+ALLOWED_CHATS=<comma‑separated ids or @usernames>
+TIMEZONE=<IANA tz name>
+"""
+
+from __future__ import annotations
+import os, re, sys, json, shutil, asyncio, logging, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import uuid # For unique filenames
 
-from dotenv import load_dotenv, set_key
-from dateutil import parser as du_parser
-from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
-from sqlite3 import OperationalError
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+# ── third‑party ────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    from dateutil import parser as du_parser
+    from telethon import TelegramClient, events
+    from telethon.tl.types import Message, User, Chat, Channel # Added more types for hinting
+    from telethon.errors.rpcerrorlist import (
+        UserIsBlockedError, ChatWriteForbiddenError, FloodWaitError,
+        FileReferenceExpiredError, MessageIdInvalidError, BotMethodInvalidError,
+        MediaEmptyError)
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError as e:  # pragma: no cover
+    missing = e.name
+    print(f"Missing dependency: {missing}.  Run:\n  pip install python-dotenv python-dateutil telethon python-zoneinfo")
+    sys.exit(1)
 
-# ─── CONFIG & ENV ──────────────────────────────────────────────────────────────
-ROOT     = Path(__file__).resolve().parent
-ENV_PATH = ROOT / ".env"
+# ── logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)-8s | %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout)])
+log = logging.getLogger("reminderbot")
+logging.getLogger('telethon').setLevel(logging.WARNING)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+# ── paths / env ────────────────────────────────────────────────────────────────
+ROOT       = Path(__file__).resolve().parent
+ENV_PATH   = ROOT / ".env"
+MEDIA_DIR  = ROOT / "media"
+REM_PATH   = ROOT / "reminders.json"
 load_dotenv(ENV_PATH)
 
-API_ID   = os.getenv("TG_API_ID")
-API_HASH = os.getenv("TG_API_HASH")
-CHAT_RAW = os.getenv("ALLOWED_CHATS", "").strip()
-SESSION_NAME = os.getenv("TG_SESSION", "reminder_session")
-DEFAULT_TZ = "Europe/Amsterdam"
-TZ_NAME  = os.getenv("TIMEZONE", DEFAULT_TZ)
-try:
-    TZ = ZoneInfo(TZ_NAME)
-    print(f"ℹ️ Using timezone: {TZ_NAME}")
-except ZoneInfoNotFoundError:
-    print(f"⚠️ Warning: Timezone '{TZ_NAME}' not found. Falling back to '{DEFAULT_TZ}'.")
-    TZ_NAME = DEFAULT_TZ; TZ = ZoneInfo(TZ_NAME)
-except Exception as e:
-    print(f"⚠️ Error loading timezone '{TZ_NAME}': {e}. Falling back to '{DEFAULT_TZ}'.")
-    TZ_NAME = DEFAULT_TZ; TZ = ZoneInfo(TZ_NAME)
+API_ID     = os.getenv("TG_API_ID")
+API_HASH   = os.getenv("TG_API_HASH")
+BOT_TOKEN  = os.getenv("TG_BOT_TOKEN")
+CHAT_RAW   = os.getenv("ALLOWED_CHATS", "").strip()
+TZ_NAME    = os.getenv("TIMEZONE", "Europe/Amsterdam")
+CHECK_SECS = 30
 
-
-# Interactive prompts for missing ENV values -----------------------------------
-def prompt_env(var, question, validate=lambda v: bool(v.strip())):
-    if not ENV_PATH.exists():
-        try: ENV_PATH.touch(); print(f"📝 Created .env file at: {ENV_PATH}")
-        except OSError as e: print(f"❌ Critical: Could not create .env file: {e}"); sys.exit(1)
-    while True:
-        val = input(question).strip()
-        if validate(val):
-            try: set_key(str(ENV_PATH), var, val, quote_mode='never'); print(f"✅ Saved {var}"); return val
-            except Exception as e: print(f"❌ Error saving {var}: {e}"); return val
-        print("❌ Invalid input.")
-
-if not API_ID: API_ID = prompt_env("TG_API_ID",   "API ID: ",    lambda v: v.isdigit())
-if not API_HASH: API_HASH = prompt_env("TG_API_HASH","API Hash: ", lambda v: len(v) >= 32)
-if os.getenv("ALLOWED_CHATS") is None:
-    print("\nRestrict commands? Enter comma-separated chat IDs/@usernames."); CHAT_RAW = input("Leave blank for all chats: ").strip()
-    set_key(str(ENV_PATH), "ALLOWED_CHATS", CHAT_RAW, quote_mode='never'); print(f"✅ Saved ALLOWED_CHATS.")
-else: CHAT_RAW = os.getenv("ALLOWED_CHATS", "").strip()
-
+if not (API_ID and API_HASH and BOT_TOKEN): log.critical("TG_API_ID / HASH / TOKEN missing in .env"); sys.exit(1)
+if not API_ID.isdigit(): log.critical("TG_API_ID must be numeric"); sys.exit(1)
 API_ID = int(API_ID)
-ALLOWED_CHATS = { int(x) if x.lstrip("-+").isdigit() else x.lstrip("@").lower() for x in CHAT_RAW.split(',') if x.strip() }
 
-# ─── SESSION HANDLING ──────────────────────────────────────────────────────────
-SESSION_DIR  = ROOT / "sessions"; SESSION_DIR.mkdir(exist_ok=True)
-SESSION_PATH = SESSION_DIR / f"{SESSION_NAME}.session"
+try: TZ = ZoneInfo(TZ_NAME); log.info("Timezone set to: %s", TZ_NAME)
+except ZoneInfoNotFoundError: log.warning("TZ '%s' not found, fallback to Europe/Amsterdam", TZ_NAME); TZ_NAME="Europe/Amsterdam"; TZ=ZoneInfo(TZ_NAME)
+except Exception as e: log.error("Error loading TZ '%s': %s. Fallback.", TZ_NAME, e); TZ_NAME="Europe/Amsterdam"; TZ=ZoneInfo(TZ_NAME)
+
+ALLOWED_CHATS: set[int|str] = {int(x) if x.lstrip("-+").isdigit() else x.lstrip("@").lower() for x in CHAT_RAW.split(',') if x.strip()}
+if ALLOWED_CHATS: log.info("Restricting commands to: %s", ALLOWED_CHATS)
+else: log.info("No chat restrictions applied.")
+
+MEDIA_ENABLED = False
 try:
-    if not os.access(SESSION_DIR, os.W_OK): raise PermissionError(f"Cannot write: {SESSION_DIR}")
-    exists = SESSION_PATH.exists(); writable = os.access(SESSION_PATH, os.W_OK) if exists else True
-except PermissionError as e: print(f"❌ Permissions error: {e}"); sys.exit(1)
-if exists and not writable: print(f"❌ Cannot write: {SESSION_PATH}"); sys.exit(1)
+    MEDIA_DIR.mkdir(exist_ok=True); test_file = MEDIA_DIR / f".write_test_{uuid.uuid4()}"; test_file.touch(); test_file.unlink(); MEDIA_ENABLED = True; log.info("Media dir '%s' writable. Attachments enabled.", MEDIA_DIR.relative_to(ROOT))
+except Exception as e: log.warning("Media dir '%s' not writable: %s. Media IGNORED.", MEDIA_DIR.relative_to(ROOT), e)
 
-# ─── TELETHON CLIENT ───────────────────────────────────────────────────────────
-client = TelegramClient(str(SESSION_PATH), API_ID, API_HASH, system_version="4.16.30-vxCUSTOM")
+# ── Telegram client ────────────────────────────────────────────────────────────
+client = TelegramClient(None, API_ID, API_HASH); log.info("Using MemorySession")
 
-# ─── CONSTANTS ─────────────────────────────────────────────────────────────────
-CMD_ADD  = re.compile(r"^/(?:add[_ ]?reminder)\s+(.+)", re.I | re.S)
-CMD_LIST = re.compile(r"^/list(?:[_ ]?reminders)?$", re.I)
-CMD_DEL  = re.compile(r"^/(?:delete|del)[_ ]?reminder\s+(\d+)$", re.I)
-CMD_HELP = re.compile(r"^/help(?:[_ ]?reminder)?$", re.I)
-TIME_RE  = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+# ── storage ────────────────────────────────────────────────────────────────────
+reminders: list[dict] = []; rem_lock = asyncio.Lock(); next_id = 1
 
-# ─── STORAGE (Robust Loading) ──────────────────────────────────────────────────
-REMINDERS_PATH = ROOT / "reminders.json"; reminders = []
-if REMINDERS_PATH.exists():
-    print(f"💾 Loading reminders from {REMINDERS_PATH}...")
+# ── regex & helpers ────────────────────────────────────────────────────────────
+CMD_ADD   = re.compile(r"^/(?:add[_ ]?reminder)(?:@\w+)?\s+(.+)", re.I | re.S)
+CMD_LIST  = re.compile(r"^/(?:list[_ ]?reminders?)(?:@\w+)?$", re.I)
+CMD_DEL   = re.compile(r"^/(?:delete|del)[_ ]?reminder(?:@\w+)?\s+(\d+)$", re.I)
+CMD_HELP  = re.compile(r"^/(?:help(?:[_ ]?reminder)?)(?:@\w+)?$", re.I)
+CMD_START = re.compile(r"^/start(?:@\w+)?$", re.I)
+TIME_RE   = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+
+# ── util ───────────────────────────────────────────────────────────────────────
+
+def parse_dt(text: str) -> datetime | None:
+    log.debug("Parsing dt: '%s'", text); naive = None; formats = ("%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M")
+    cleaned_text = text.strip()
+    for fmt in formats:
+        try: naive = datetime.strptime(cleaned_text, fmt); log.debug("Parsed with strptime '%s'", fmt); break
+        except ValueError: continue
+    if naive is None:
+        log.debug("Trying dateutil...");
+        try: naive = du_parser.parse(cleaned_text, parserinfo=du_parser.parserinfo(dayfirst=True), fuzzy=False); log.debug("Parsed with dateutil")
+        except (du_parser.ParserError, ValueError, OverflowError) as e: log.debug("Dateutil failed: %s", e); return None
+        except Exception as e: log.error("Unexpected dateutil error: %s", e, exc_info=True); return None
     try:
-        loaded_data = json.loads(REMINDERS_PATH.read_text(encoding='utf-8'))
-        if isinstance(loaded_data, list):
-            valid_items = [r for r in loaded_data if isinstance(r, dict) and all(k in r for k in ['id', 'chat_id', 'scheduled_id', 'time'])]
-            if len(valid_items) != len(loaded_data): print(f"⚠️ Filtered {len(loaded_data) - len(valid_items)} invalid items.")
-            reminders = valid_items; print(f"✅ Loaded {len(reminders)} reminders.")
-        else: print(f"⚠️ Not a JSON list. Init empty."); reminders = []
-    except (json.JSONDecodeError, Exception) as e: print(f"⚠️ Error loading: {e}. Init empty."); reminders = []
-else: print(f"ℹ️ Reminders file not found.")
-next_id = max([r.get("id", 0) for r in reminders], default=0) + 1
-print(f"ℹ️ Next reminder ID: {next_id}")
+        if naive.tzinfo is None: local = naive.replace(tzinfo=TZ); log.debug("Applied TZ via replace: %s", local)
+        else: local = naive.astimezone(TZ); log.debug("Converted aware time: %s", local)
+        has_time = TIME_RE.search(text)
+        if local.hour == 0 and local.minute == 0 and local.second == 0 and not has_time: log.debug("Applying default 9am"); local = local.replace(hour=9, minute=0, second=0, microsecond=0)
+        else: log.debug("Not applying default time")
+        utc_dt = local.astimezone(timezone.utc); log.debug("Final UTC: %s", utc_dt); return utc_dt
+    except Exception as e: log.error("TZ apply error: %s", e, exc_info=True); return None
 
-def save_reminders():
-    valid_reminders = [r for r in reminders if isinstance(r, dict) and all(k in r for k in ['id', 'chat_id', 'scheduled_id', 'time'])]
-    print(f"💾 Saving {len(valid_reminders)} reminders...")
+async def load_reminders() -> None:
+    global reminders, next_id
+    async with rem_lock:
+        if REM_PATH.exists():
+            log.info("Loading reminders from %s", REM_PATH)
+            try:
+                raw_data = REM_PATH.read_text("utf-8"); loaded_list = json.loads(raw_data or "[]")
+                if isinstance(loaded_list, list):
+                    valid_reminders = []; required_keys = {'id', 'chat_id', 'time', 'caption', 'user_id'}
+                    for item in loaded_list:
+                        if isinstance(item, dict) and required_keys.issubset(item.keys()) and \
+                           all(isinstance(item.get(k), int) for k in ['id', 'chat_id', 'user_id']) and \
+                           isinstance(item.get('time'), str) and isinstance(item.get('caption'), str):
+                            valid = True
+                            for key, expected_type in [('media_path', (str, type(None))), ('replied_chat_id', (int, type(None))), ('replied_message_id', (int, type(None)))]:
+                                if key in item and not isinstance(item.get(key), expected_type): log.warning("Invalid type for opt key '%s' ID %s, skipping.", key, item.get('id')); valid = False; break
+                            if valid:
+                                try: datetime.fromisoformat(item['time']); valid_reminders.append(item)
+                                except ValueError: log.warning("Invalid time ISO format ID %s, skipping.", item.get('id'))
+                        else: log.warning("Missing/invalid required keys/types: %s, skipping.", item)
+                    reminders = valid_reminders; log.info("Loaded %d valid reminders.", len(reminders))
+                else: log.warning("%s not JSON list. Starting fresh.", REM_PATH); reminders = []
+            except Exception as e: log.error("Could not read/parse %s: %s", REM_PATH, e, exc_info=True); reminders = []
+        else: log.info("%s not found. Starting empty.", REM_PATH); reminders = []
+        next_id = max((r.get("id", 0) for r in reminders), default=0) + 1
+        log.info("Next reminder ID set to %d", next_id)
+
+async def save_reminders() -> None:
+    global reminders
+    async with rem_lock: reminders_to_save = list(reminders)
+    if not os.access(REM_PATH.parent, os.W_OK): log.error("Cannot write to %s dir – skip save!", REM_PATH.parent); return
+    tmp_path = REM_PATH.with_suffix(".tmp"); log.debug("Saving %d reminders to %s", len(reminders_to_save), REM_PATH)
     try:
-        temp_path = REMINDERS_PATH.with_suffix('.tmp')
-        with open(temp_path, 'w', encoding='utf-8') as f: json.dump(valid_reminders, f, indent=2, ensure_ascii=False)
-        shutil.move(str(temp_path), str(REMINDERS_PATH)); print(f"✅ Reminders saved.")
-    except Exception as e: print(f"❌ Error saving: {e}"); temp_path.unlink(missing_ok=True)
+        tmp_path.write_text(json.dumps(reminders_to_save, indent=2, ensure_ascii=False), "utf-8"); shutil.move(str(tmp_path), str(REM_PATH)); log.info("Reminders saved successfully.")
+    except Exception as e: log.error("Failed saving reminders: %s", e, exc_info=True); tmp_path.unlink(missing_ok=True)
 
-# ─── PARSE DATETIME ──────────────────────────────────────────────────────────────
-def parse_dt(text: str):
-    try:
-        parser_info = du_parser.parserinfo(dayfirst=True); dt_naive = du_parser.parse(text, parserinfo=parser_info, fuzzy=False)
-        dt_local = dt_naive.replace(tzinfo=TZ) if dt_naive.tzinfo is None else dt_naive.astimezone(TZ)
-        if dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0 and not TIME_RE.search(text):
-            dt_local = dt_local.replace(hour=9, minute=0, second=0, microsecond=0)
-        return dt_local.astimezone(timezone.utc)
-    except (du_parser.ParserError, ValueError): return None
-    except Exception as e: print(f"❌ PARSE ERROR: {e}"); return None
+async def is_allowed(ev: events.NewMessage.Event) -> bool:
+    """Checks if the event originated from an allowed chat/user."""
+    if not ALLOWED_CHATS:
+        return True # No restrictions
 
-# ─── SCHEDULE REMINDER (Force Upload via Path) ─────────────────────────────────
-async def schedule_reminder(ev, when: datetime, caption: str,
-                            media_path: str | None = None,    # ONLY use uploaded path now
-                            tmp_dir_to_clean: str | None = None):
-    """Schedules the message. Uses media_path for upload."""
-    global next_id
-    if not isinstance(when, datetime) or when.tzinfo != timezone.utc:
-        print(f"❌ Internal Error: schedule_reminder needs UTC datetime"); await ev.reply("❌ Internal error (time)."); return None
-
-    sender = await ev.get_sender(); mention = f"[{sender.first_name or 'User'}](tg://user?id={sender.id})"
-    text = f"⏰ {mention}: {caption}" if caption else f"⏰ Reminder for {mention}"
-
-    now = datetime.now(timezone.utc); min_schedule_delay = timedelta(seconds=10)
-    if when <= now + min_schedule_delay:
-        original_time_str = when.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
-        when = now + min_schedule_delay; new_time_str = when.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
-        print(f"⚠️ Time adjusted: {original_time_str} -> {new_time_str}")
-
-    msg = None
-    try:
-        when_local_debug = when.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
-        schedule_method = "text only"
-        if media_path: schedule_method = f"uploading from '{media_path}'"
-        print(f"[DEBUG schedule] Attempting schedule: chat={ev.chat_id}, time={when_local_debug}, method={schedule_method}, text='{text[:100]}...'")
-
-        if media_path:
-            print(f"[DEBUG schedule] Calling send_file with file=media_path")
-            msg = await client.send_file(ev.chat_id, file=media_path, caption=text, schedule=when, parse_mode="md")
-        else:
-             print(f"[DEBUG schedule] Calling send_message (no media)")
-             msg = await client.send_message(ev.chat_id, text, schedule=when, parse_mode="md")
-
-        if msg: print(f"[DEBUG schedule] API call OK, msg_id={msg.id}.")
-        else: raise ValueError("Scheduling API call did not return message object.")
-
-    except Exception as e:
-        print(f"❌ Failed to schedule message: {e}"); import traceback; traceback.print_exc()
-        await ev.reply(f"❌ Failed to schedule message via API: {type(e).__name__}")
-        if tmp_dir_to_clean: shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
-        return None
-    finally:
-        if tmp_dir_to_clean: print(f"[DEBUG schedule] Cleaning tmp dir: {tmp_dir_to_clean}"); shutil.rmtree(tmp_dir_to_clean, ignore_errors=True)
-
-    # --- Store Reminder ---
-    current_id = next_id
-    reminder = {
-        "id": current_id, "chat_id": ev.chat_id, "scheduled_id": msg.id,
-        "time": when.isoformat(), "caption": caption, "user_id": sender.id,
-        "media_info": {"method": "upload" if media_path else "none"}
-    }
-    reminders.append(reminder); save_reminders()
-    print(f"✅ Stored reminder locally: id={current_id}, sched_id={msg.id}, method={reminder['media_info']['method']}")
-    next_id += 1
-    return reminder["id"]
-
-# ─── UTILITY: Check Chat Permission ────────────────────────────────────────────
-async def is_allowed(ev):
-    if not ALLOWED_CHATS: return True
+    # Assign variables only if needed (i.e., if restrictions exist)
     chat_id = ev.chat_id
+    sender_id = ev.sender_id
+
+    # Check direct IDs first
     if chat_id in ALLOWED_CHATS: return True
-    try: chat = await ev.get_chat(); uname = getattr(chat, "username", None)
-    except Exception as e: print(f"ℹ️ Could not get username for {chat_id}: {e}"); uname = None
-    if uname and uname.lower() in ALLOWED_CHATS: return True
-    sender = await ev.get_sender(); sender_info = f"@{sender.username}" if sender.username else f"ID {sender.id}"
-    print(f"🚫 Denied in chat {chat_id} for {sender_info}."); return False
+    if sender_id in ALLOWED_CHATS: return True
 
-# ─── HANDLERS ─────────────────────────────────────────────────────────────────
-@client.on(events.NewMessage(pattern=CMD_ADD))
-async def add_handler(ev):
-    if not await is_allowed(ev): return
+    # Check usernames (case-insensitive)
+    try: # Checking chat username requires fetching chat info
+        chat = await ev.get_chat()
+        uname = getattr(chat, "username", None); log.debug("Checking chat @%s", uname);
+        if uname and uname.lower() in ALLOWED_CHATS: return True
+    except Exception: pass # Ignore errors fetching chat (e.g., restricted)
 
-    print(f"[RECV /add] chat={ev.chat_id}, user={ev.sender_id}, msg='{ev.raw_text[:100]}...'")
-    match = CMD_ADD.match(ev.raw_text); tail = match.group(1).strip() if match else ""
-    if not tail: await ev.reply("⚠️ Usage: `/add reminder <when> <text>`"); return
+    try: # Check sender username
+        sender = await ev.get_sender()
+        uname = getattr(sender, "username", None); log.debug("Checking sender @%s", uname);
+        if uname and uname.lower() in ALLOWED_CHATS: return True
+    except Exception: pass # Ignore errors fetching sender
 
-    # --- Parse Date/Time and Caption from the command ---
-    tokens = tail.split(); parsed_dt_utc = None; command_caption = ""; successful_parse_index = -1
-    for i in range(1, len(tokens) + 1):
-        potential_date_str = " ".join(tokens[:i])
-        temp_dt = parse_dt(potential_date_str)
-        if temp_dt: parsed_dt_utc = temp_dt; successful_parse_index = i
-        elif successful_parse_index != -1: break
-    if successful_parse_index != -1: command_caption = " ".join(tokens[successful_parse_index:]).strip()
-    else: parsed_dt_utc = None
-    if not parsed_dt_utc: await ev.reply("❌ Couldn't parse date/time."); return
-    print(f"[DEBUG add] Parsed: time_utc='{parsed_dt_utc}', command_caption='{command_caption}'")
+    # If none match, deny
+    log.warning("Denied command: user=%s chat=%s (Not in ALLOWED_CHATS)", sender_id, chat_id)
+    return False
 
-    # --- Check Time ---
-    now = datetime.now(timezone.utc); min_future_delta = timedelta(seconds=5)
-    if parsed_dt_utc <= now + min_future_delta: await ev.reply("⏳ Time is past/too soon!"); return
+# ── background loop ────────────────────────────────────────────────────────────
+async def ticker():
+    await asyncio.sleep(15); log.info("Reminder check ticker started (interval: %ds)", CHECK_SECS)
+    while True:
+        start_time = time.monotonic(); now = datetime.now(timezone.utc); log.debug("Ticker check at %s", now.isoformat())
+        to_del_ids: list[int] = []; reminders_checked = 0;
+        async with rem_lock: reminders_snapshot = list(reminders)
+        for r_data in reminders_snapshot:
+            reminders_checked += 1;
+            try:
+                reminder_time = datetime.fromisoformat(r_data["time"])
+                if reminder_time <= now:
+                    log.info("Reminder ID %d due.", r_data["id"]); should_delete = await send_reminder(r_data)
+                    if should_delete: to_del_ids.append(r_data["id"])
+                    else: log.warning("Send failed temporarily ID %d, will retry.", r_data["id"])
+            except ValueError: log.error("Invalid time fmt ID %d ('%s'), removing.", r_data.get('id'), r_data.get('time')); to_del_ids.append(r_data["id"])
+            except Exception as e: log.error("Error processing check ID %d: %s", r_data.get('id'), e, exc_info=True)
+        if to_del_ids:
+            log.info("Removing %d reminder(s): %s", len(to_del_ids), to_del_ids); removed_count = 0
+            async with rem_lock: original_len = len(reminders); reminders[:] = [r for r in reminders if r.get("id") not in to_del_ids]; removed_count = original_len - len(reminders)
+            if removed_count > 0: await save_reminders()
+            else: log.warning("Attempted remove %d IDs but list unchanged.", len(to_del_ids))
+        proc_time = time.monotonic() - start_time; sleep_for = max(0.5, CHECK_SECS - proc_time)
+        log.debug("Ticker check done (%d checked, %d due, %.2fs). Sleep %.1fs", reminders_checked, len(to_del_ids), proc_time, sleep_for)
+        await asyncio.sleep(sleep_for)
 
-    # --- Media handling & Get Original Text ---
-    media_path = None; tmp_dir = None; source_message = None; media_source_info = ""
-    media_acquired = False; original_text = None
+# ── send reminder ──────────────────────────────────────────────────────────────
+async def send_reminder(r: dict) -> bool:
+    """Sends the reminder, handling media and errors. Returns True if reminder should be deleted."""
+    chat_id = r["chat_id"]; reminder_id = r["id"]; user_id = r.get("user_id"); caption = r.get("caption", "")
+    media_filename = r.get("media_path"); media_full_path = MEDIA_DIR / media_filename if media_filename else None
+    replied_chat_id = r.get("replied_chat_id"); replied_message_id = r.get("replied_message_id")
+    permanent_fail = False; log.info("Sending reminder ID %d to chat %s", reminder_id, chat_id)
+    mention = f"User {user_id}"
+    try:
+        if user_id: user = await client.get_entity(user_id); name = getattr(user, 'first_name', '') + (' ' + getattr(user, 'last_name', '') if getattr(user, 'last_name', '') else ''); mention = f"[{name.strip() or f'User {user_id}'}](tg://user?id={user_id})"
+    except ValueError: log.warning("User %s not found for mention", user_id)
+    except Exception as e: log.warning("Failed getting mention user %s: %s", user_id, e)
+    text = f"⏰ **Reminder for {mention}:**\n\n{caption}" if caption else f"⏰ Reminder for {mention}"
 
-    if ev.media: source_message = ev; media_source_info = "from command msg"
-    elif ev.is_reply:
-        reply_msg = await ev.get_reply_message()
-        if reply_msg:
-             source_message = reply_msg; media_source_info = f"from reply {reply_msg.id}"
-             original_text = reply_msg.text; print(f"[DEBUG add] Original text: '{original_text[:100]}...'")
-             # No forward check needed now
-        else: print("[DEBUG add] Reply message object not found.")
-    if source_message: print(f"[DEBUG add] Found source message {media_source_info}")
-    else: print("[DEBUG add] No source message identified.")
-
-    # --- Download ---
-    if source_message and source_message.media:
-         print(f"[DEBUG media] Attempting download {media_source_info}.")
-         try:
-             tmp_dir_path = Path(tempfile.mkdtemp(prefix="tgrem_media_")); tmp_dir = str(tmp_dir_path)
-             print(f"[DEBUG media] Download target: {tmp_dir}")
-             dl_path = await source_message.download_media(file=tmp_dir)
-             if dl_path and Path(dl_path).is_file(): media_path = dl_path; media_acquired = True; print(f"[DEBUG media] Download successful: {media_path}")
-             else: print(f"⚠️ Download failed/invalid path: {dl_path}"); media_path = None; media_acquired = False
-         except Exception as e:
-             print(f"❌ Download failed: {e}"); await ev.reply(f"⚠️ Download failed {media_source_info}. Text only.")
-             media_path = None; media_acquired = False
-             if tmp_dir: shutil.rmtree(tmp_dir, ignore_errors=True); print(f"[DEBUG media] Cleaned tmp dir {tmp_dir} after DL error."); tmp_dir = None
-
-    # --- Combine Captions (No Forwarding) ---
-    final_caption = command_caption or ""; original_text_str = original_text or ""
-    if original_text_str and original_text_str.strip() != final_caption.strip():
-        separator = "\n\n---\n" if final_caption else ""
-        final_caption = f"{final_caption}{separator}{original_text_str}"; print("[DEBUG add] Appended original text.")
-    if final_caption is None: final_caption = ""
-    print(f"[DEBUG add] Final caption for schedule: '{final_caption[:100]}...'")
-
-    # --- Schedule ---
-    local_id = await schedule_reminder(ev, parsed_dt_utc, final_caption, media_path=media_path, tmp_dir_to_clean=tmp_dir)
-
-    # --- Confirmation (Simplified) ---
-    if local_id is not None:
+    reply_link = ""
+    if replied_chat_id and replied_message_id:
         try:
-            loc_dt_str = parsed_dt_utc.astimezone(TZ).strftime('%d-%m-%Y %H:%M %Z')
-            await ev.reply(f"✅ Reminder scheduled! (ID: {local_id})\nTime: **{loc_dt_str}**", parse_mode="md")
-        except Exception as e: print(f"Error formatting confirmation: {e}"); await ev.reply(f"✅ Reminder scheduled! (ID: {local_id})", parse_mode="md")
+            if str(replied_chat_id).startswith("-100"): link_chat_id = str(replied_chat_id)[4:]
+            else: link_chat_id = str(abs(replied_chat_id))
+            reply_link = f"\n\n🔗 [Original Message](https://t.me/c/{link_chat_id}/{replied_message_id})"
+        except Exception as e: log.warning("Failed to create reply link msg %d chat %d: %s", replied_message_id, replied_chat_id, e)
+    text += reply_link
 
-
-@client.on(events.NewMessage(pattern=CMD_LIST))
-async def list_handler(ev):
-    if not await is_allowed(ev): return
-    print(f"[RECV /list] chat={ev.chat_id}, user={ev.sender_id}")
-    now = datetime.now(timezone.utc)
-    valid_reminders_local = []
-    needs_resave = False
-
-    # --- Cleanup Logic ---
-    for r in list(reminders):
-         if not (isinstance(r, dict) and all(k in r for k in ['id','chat_id','scheduled_id','time'])):
-             print(f"⚠️ Removing invalid structure: {r}"); needs_resave = True
-             try: reminders.remove(r)
-             except ValueError: print(f"    Info: Invalid item {r.get('id', '(no id)')} not found.")
-             continue
-         try:
-             r_time_utc = datetime.fromisoformat(r["time"])
-             if r_time_utc.tzinfo is None:
-                print(f"⚠️ ID {r.get('id')}: naive datetime, assuming UTC."); r_time_utc = r_time_utc.replace(tzinfo=timezone.utc); needs_resave = True
-                updated = False; current_id = r.get('id')
-                for i, item in enumerate(reminders):
-                    if item.get("id") == current_id: reminders[i]["time"] = r_time_utc.isoformat(); updated = True; break
-                if not updated: print(f"    Warning: Could not find ID {current_id} to update time.")
-             if r_time_utc > now: valid_reminders_local.append(r)
-             else:
-                 print(f"ℹ️ Removing past id={r.get('id')}"); needs_resave = True
-                 try: reminders.remove(r)
-                 except ValueError: print(f"    Info: Past item {r.get('id', '(no id)')} not found.")
-         except (ValueError, Exception) as e:
-             print(f"⚠️ Removing invalid id={r.get('id')}: {e}"); needs_resave = True
-             try: reminders.remove(r)
-             except ValueError: print(f"    Info: Error item {r.get('id', '(no id)')} not found.")
-             continue
-    if needs_resave: print("ℹ️ Resaving reminders list after cleanup."); save_reminders()
-    # --- End Cleanup ---
-
-    active_reminders = sorted(valid_reminders_local, key=lambda r: datetime.fromisoformat(r["time"]))
-    if not active_reminders: await ev.reply("ℹ️ No upcoming reminders."); return
-
-    # --- User Info Fetch ---
-    user_ids_needed = {r.get('user_id') for r in active_reminders if r.get('user_id')}
-    user_info_cache = {}
-    if user_ids_needed:
-        print(f"[DEBUG list] Fetching info for user IDs: {user_ids_needed}")
+    media_sent = False
+    if media_full_path and media_full_path.exists():
+        log.debug("Attempting send with media: %s", media_full_path)
         try:
-            entities = await client.get_entity(list(user_ids_needed))
-            if not isinstance(entities, list): entities = [entities]
-            for user in entities:
-                if user: user_info_cache[user.id] = user
-        except Exception as fetch_err: print(f"⚠️ Error pre-fetching users: {fetch_err}")
+            await client.send_file(chat_id, file=media_full_path, caption=text, parse_mode="md", link_preview=False); log.info("Reminder %d sent WITH media.", reminder_id); media_sent = True
+            try: log.debug("Deleting sent media file: %s", media_full_path); media_full_path.unlink()
+            except OSError as e: log.error("Failed deleting media file %s: %s", media_full_path, e)
+            return True
+        except FileReferenceExpiredError: log.warning("File ref expired for %s, fallback text.", media_full_path)
+        except BotMethodInvalidError: log.error("Media type mismatch %s. Fallback text.", media_full_path); permanent_fail = True
+        except Exception as e: log.error("Failed send %d WITH media: %s. Fallback text.", reminder_id, e, exc_info=True)
 
-    # --- Build Formatted Message ---
-    message_parts = ["**Upcoming Reminders:**\n"] # Start with bold title
-
-    for r in active_reminders:
+    if not media_sent:
+        log.debug("Sending reminder %d TEXT ONLY.", reminder_id); fallback_note = ""
+        if media_filename and not (media_full_path and media_full_path.exists()): fallback_note = "\n\n_(Note: media file missing)_"
+        elif media_filename: fallback_note = "\n\n_(Note: failed sending media)_"
         try:
-            # Reminder Header (Bold ID and Number)
-            message_parts.append(f"**🗓️ ID {r.get('id', '?')}**") # <<< Bold ID, no italics
+            final_text = text + fallback_note
+            await client.send_message(chat_id, final_text, parse_mode="md", link_preview=False); log.info("Reminder %d sent TEXT ONLY.", reminder_id)
+            if permanent_fail and media_filename:
+                 log.warning("Perm media fail ID %d, text OK. Deleting file.", reminder_id)
+                 if media_full_path:
+                     try: media_full_path.unlink(missing_ok=True)
+                     except OSError as e: log.error("Failed cleanup media file %s for perm fail: %s", media_full_path, e)
+            return True
 
-            # Date Line (Bold Label)
-            when_local = datetime.fromisoformat(r["time"]).astimezone(TZ)
-            time_str = when_local.strftime('%d-%m-%Y %H:%M %Z')
-            message_parts.append(f"   • **Date:** {time_str}") # <<< Bold label
+        except (UserIsBlockedError, ChatWriteForbiddenError) as e:
+            log.error("Cannot send to chat %s (Blocked/Forbidden): %s. Removing %d.", chat_id, e, reminder_id)
+            if media_full_path:
+                 try: media_full_path.unlink(missing_ok=True)
+                 except OSError as unlink_e: log.error("Failed cleanup media file %s on block/forbidden: %s", media_full_path, unlink_e)
+            return True # Permanent failure
+        except FloodWaitError as e: log.warning("Flood wait (%ds) sending %d. Will retry.", e.seconds, reminder_id); await asyncio.sleep(e.seconds + 1); return False
+        except Exception as e: log.error("Failed send TEXT reminder %d: %s", reminder_id, e, exc_info=True); return False
 
-            # Reminder Text Line (Bold Label)
-            caption = r.get('caption', '').strip()
-            if not caption:
-                reminder_text = "_(no description provided)_" # Keep italics for placeholder
-            else:
-                caption_clean = caption.replace('_', '').replace('*', '').replace('`','')
-                max_caption_len = 70
-                if len(caption_clean) > max_caption_len:
-                    caption_clean = caption_clean[:max_caption_len-1] + "…"
-                reminder_text = caption_clean
-            message_parts.append(f"   • **Reminder:** {reminder_text}") # <<< Bold label
-
-            # Creator Line (Bold Label)
-            creator_name = f"ID {r.get('user_id', 'Unknown')}" # Default
-            user_id = r.get('user_id')
-            if user_id:
-                user_entity = user_info_cache.get(user_id)
-                if not user_entity and user_id not in user_info_cache:
-                    try:
-                        user_entity = await client.get_entity(user_id); user_info_cache[user_id] = user_entity
-                    except Exception: user_info_cache[user_id] = None
-
-                if user_entity:
-                    username = getattr(user_entity, 'username', None)
-                    first_name = getattr(user_entity, 'first_name', None)
-                    if username:
-                        creator_name = username # No '@'
-                    elif first_name:
-                        creator_name = first_name
-            message_parts.append(f"   • **By:** {creator_name}") # <<< Bold label
-
-            # Add a blank line for separation
-            message_parts.append("")
-
-        except Exception as e:
-            print(f"Err format id={r.get('id','?')}: {e}");
-            # Add error line in the new format
-            message_parts.append(f"**🗓️ ID {r.get('id','?')}**") # Bold ID
-            message_parts.append("   • **Error:** formatting this reminder.") # Bold label
-            message_parts.append("")
-
-
-    # --- Send the message ---
-    final_message = "\n".join(message_parts).strip()
-
-    if len(final_message) > 4096:
-        final_message = final_message[:4050] + "\n\n... (list truncated)"
-
-    await ev.reply(final_message, parse_mode="md")
-
-
-@client.on(events.NewMessage(pattern=CMD_DEL))
-async def delete_handler(ev):
-    if not await is_allowed(ev): return; print(f"[RECV /delete] {ev.chat_id} {ev.sender_id} '{ev.raw_text}'")
-    match = CMD_DEL.match(ev.raw_text)
-    if not match: await ev.reply("❌ Use `/del reminder <ID>`."); return
-    try: rid_to_delete = int(match.group(1))
-    except ValueError: await ev.reply("❌ Invalid ID."); return
-    reminder_to_delete = None; reminder_index = -1
-    for i, r in enumerate(reminders):
-        if isinstance(r, dict) and r.get("id") == rid_to_delete: reminder_to_delete = r; reminder_index = i; break
-    if reminder_to_delete and reminder_index != -1:
-        sched_id = reminder_to_delete.get("scheduled_id"); target_chat_id = reminder_to_delete.get("chat_id")
-        deleted_from_tg = False; is_future = False
-        try: is_future = datetime.fromisoformat(reminder_to_delete["time"]).replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
-        except: pass
-        if sched_id and target_chat_id and is_future:
-            try: print(f"[DEBUG delete] Attempt TG delete: sched={sched_id}"); await client.delete_scheduled_messages(target_chat_id, [sched_id]); print(f"✅ TG delete OK"); deleted_from_tg = True
-            except Exception as e: print(f"⚠️ TG delete fail: {e}")
-        elif not is_future: print(f"ℹ️ id={rid_to_delete} past, skip TG delete.")
-        else: print(f"⚠️ id={rid_to_delete} lacks info, skip TG delete.")
-        try:
-             del reminders[reminder_index]; save_reminders(); print(f"🗑️ Removed id={rid_to_delete} locally.")
-             tg_status = " (TG delete attempted)" if deleted_from_tg else ""
-             await ev.reply(f"✅ Reminder **{rid_to_delete}** deleted{tg_status}.", parse_mode="md")
-        except IndexError: print(f"⚠️ id={rid_to_delete} gone before local delete."); await ev.reply(f"ℹ️ ID **{rid_to_delete}** already removed?", parse_mode="md")
-    else: print(f"[DEBUG delete] id={rid_to_delete} not found."); await ev.reply(f"❌ No active reminder **{rid_to_delete}**.", parse_mode="md")
+# ── command handlers ───────────────────────────────────────────────────────────
+@client.on(events.NewMessage(pattern=CMD_START))
+async def handle_start(ev: events.NewMessage.Event):
+    if not await is_allowed(ev): return; await ev.reply("👋 Hi! I'm the reminder bot. Use /help.")
 
 @client.on(events.NewMessage(pattern=CMD_HELP))
-async def help_handler(ev):
+async def handle_help(ev: events.NewMessage.Event):
     if not await is_allowed(ev): return
-    help_text = """**Reminder Bot Commands:**\n🗓️ `/add reminder <when> <your text>`\n   Schedule reminder. If replying, includes original text & media.\n   `<when>`: `tomorrow 9am`, `15-08-2024 10:00`, etc.\n📋 `/list reminders`\n   Show upcoming reminders in detailed format, including creator.\n🗑️ `/delete reminder <ID>`\n   Remove reminder by ID. Attempts TG delete."""
-    await ev.reply(help_text, parse_mode="md")
+    help_msg = ("🤖 **Reminder Bot**\n\n🔹 `/add <when> <msg>`\n   Sets reminder. Reply to attach media/text & link.\n   *Ex:* `/add tmr 10am Check mail`\n\n🔹 `/list`\n   Shows reminders.\n\n🔹 `/del <id>`\n   Deletes by ID.\n\n" + f"*{TZ_NAME} timezone. 9am default.*")
+    await ev.reply(help_msg, parse_mode="md") # Shortened example commands
 
-# ─── RUN LOOP / MAIN FUNCTION ──────────────────────────────────────────────────
+@client.on(events.NewMessage(pattern=CMD_ADD))
+async def handle_add(ev: events.NewMessage.Event):
+    if not await is_allowed(ev): return
+
+    match = CMD_ADD.match(ev.raw_text)
+    if not match:
+        log.warning("CMD_ADD pattern failed despite handler trigger: %s", ev.raw_text)
+        return
+    tail = match.group(1).strip()
+
+    if not tail: await ev.reply("Usage: `/add <when> [<text>]`"); return
+
+    log.info("Processing /add from user %d in chat %d", ev.sender_id, ev.chat_id)
+    tokens = tail.split(); parsed_dt_utc = None; command_caption = ""; parse_idx = -1
+
+    for i in range(1, len(tokens) + 1):
+        chunk = " ".join(tokens[:i]); dt = parse_dt(chunk)
+        if dt: parse_idx = i; parsed_dt_utc = dt
+        elif parse_idx != -1: break
+    if parse_idx == -1: await ev.reply("❌ Couldn't understand date/time."); return
+    command_caption = " ".join(tokens[parse_idx:]).strip()
+
+    if parsed_dt_utc <= datetime.now(timezone.utc) + timedelta(seconds=CHECK_SECS // 2): await ev.reply("⏳ Time too soon."); return
+
+    reply_msg: Message | None = None; replied_chat_id: int | None = None; replied_message_id: int | None = None
+    if ev.is_reply:
+        reply_msg = await ev.get_reply_message()
+        if reply_msg: replied_chat_id = reply_msg.chat_id; replied_message_id = reply_msg.id; log.debug("Command is reply to msg %d chat %d", replied_message_id, replied_chat_id)
+
+    final_caption = command_caption
+    if not final_caption and reply_msg and reply_msg.text: final_caption = reply_msg.text.strip(); log.info("Using replied text as caption.")
+    elif not final_caption and not (reply_msg and reply_msg.media): await ev.reply("⚠️ Need text or reply to msg w/ text/media."); return
+
+    media_filename = None; media_source_msg: Message | None = None
+    if MEDIA_ENABLED:
+        if ev.media and not ev.web_preview: media_source_msg = ev
+        elif reply_msg and reply_msg.media and not reply_msg.web_preview: media_source_msg = reply_msg
+        if media_source_msg:
+            try:
+                target_dir = MEDIA_DIR; log.info("Downloading media from msg %d to %s...", media_source_msg.id, target_dir)
+                downloaded_path_str = await media_source_msg.download_media(file=target_dir)
+                if downloaded_path_str:
+                    dl_path = Path(downloaded_path_str)
+                    if dl_path.exists() and dl_path.stat().st_size > 0: media_filename = dl_path.name; log.info("Media DL OK: %s", media_filename)
+                    else: log.error("DL ok but '%s' missing/empty.", dl_path); dl_path.unlink(missing_ok=True); await ev.reply("⚠️ Failed verify media.")
+                else: log.error("download_media no path."); await ev.reply("⚠️ Failed save media.")
+            except Exception as e: log.error("Media DL failed: %s", e, exc_info=True); await ev.reply(f"⚠️ Error DL media: {type(e).__name__}"); media_filename = None
+
+    global next_id
+    async with rem_lock:
+        current_id = next_id; next_id += 1
+        reminder_data = { "id": current_id, "chat_id": ev.chat_id, "time": parsed_dt_utc.isoformat(), "caption": final_caption, "user_id": ev.sender_id, "media_path": media_filename, "replied_chat_id": replied_chat_id, "replied_message_id": replied_message_id, }
+        reminders.append(reminder_data); log.info("Stored reminder ID %d: %s", current_id, reminder_data)
+    await save_reminders()
+    local_time_str = parsed_dt_utc.astimezone(TZ).strftime("%d %b %Y at %H:%M %Z"); response = f"✅ Reminder `#{current_id}` set for **{local_time_str}**."
+    if media_filename: response += "\n📎 Media attached."
+    elif media_source_msg and not media_filename: response += "\n*(Media attach failed)*"
+    if replied_message_id: response += "\n🔗 Link to original msg included."
+    await ev.reply(response, parse_mode="md")
+
+@client.on(events.NewMessage(pattern=CMD_LIST))
+async def handle_list(ev: events.NewMessage.Event):
+    if not await is_allowed(ev): return
+    async with rem_lock: chat_reminders = [r for r in reminders if r.get('chat_id') == ev.chat_id]
+    if not chat_reminders: await ev.reply("📭 No reminders set for this chat."); return
+    try: chat_reminders.sort(key=lambda r: datetime.fromisoformat(r.get('time', '')))
+    except Exception as e: log.error("Sort error: %s", e); await ev.reply("⚠️ Error sorting.")
+    lines = [f"📋 **Upcoming Reminders (TZ: {TZ_NAME}):**\n"]; count = 0; max_show=15
+    for r in chat_reminders:
+        if count >= max_show: lines.append(f"*... {len(chat_reminders) - count} more.*"); break
+        try:
+            dt = datetime.fromisoformat(r['time']).astimezone(TZ); time_fmt = dt.strftime("%d %b, %H:%M"); icon = "📎" if r.get('media_path') else "💬"; cap = r.get('caption', '')[:50]
+            if len(r.get('caption', '')) > 50: cap += "..."; link_icon = "🔗" if r.get('replied_message_id') else ""
+            if not cap and icon == "📎": cap = "(Media only)"
+            elif not cap: cap = "(No text)"
+            lines.append(f"🔹 `ID: {r['id']}` | {time_fmt}\n   `→` {icon}{link_icon} {cap}")
+            count += 1
+        except Exception as e: log.error("List format error ID %d: %s", r.get('id'), e); lines.append(f"🔹 `ID: {r.get('id')}` - Error")
+    await ev.reply("\n".join(lines), parse_mode="md")
+
+@client.on(events.NewMessage(pattern=CMD_DEL))
+async def handle_delete(ev: events.NewMessage.Event):
+    if not await is_allowed(ev): return
+
+    match = CMD_DEL.match(ev.raw_text)
+    if not match:
+        await ev.reply("Usage: `/del <id>`")
+        return
+
+    try: rid = int(match.group(1))
+    except ValueError: await ev.reply("❌ Invalid ID."); return
+
+    removed = False; media_to_del = None
+    async with rem_lock:
+        original_len = len(reminders); found_reminder = None
+        for r in reminders:
+            if r.get('id') == rid and r.get('chat_id') == ev.chat_id: found_reminder = r; break
+        if found_reminder: reminders.remove(found_reminder); media_to_del = found_reminder.get("media_path"); removed = True
+    if removed:
+        log.info("Deleted ID %d chat %d.", rid, ev.chat_id); await save_reminders()
+        if media_to_del:
+            media_file = MEDIA_DIR / media_to_del;
+            try: log.debug("Deleting media file %s", media_file); media_file.unlink(missing_ok=True)
+            except OSError as e: log.error("Failed deleting media file %s: %s", media_file, e)
+        await ev.reply(f"✅ Reminder `#{rid}` deleted.")
+    else: log.warning("Delete fail ID %d chat %d.", rid, ev.chat_id); await ev.reply(f"❌ Reminder `#{rid}` not found.")
+
+# ── main execution ─────────────────────────────────────────────────────────────
 async def main():
-    print("🚀 Reminder Userbot Starting..."); print(f"   Session: {SESSION_PATH}, TZ: {TZ_NAME}")
+    log.info("Starting Reminder Bot..."); print_config(); await load_reminders(); ticker_task = None
     try:
-        print("🔗 Connecting..."); await client.start(); me = await client.get_me()
-        print(f"✅ Connected as @{me.username}"); print(f"👂 Listening...")
-        await client.run_until_disconnected()
-    except (OperationalError, SessionPasswordNeededError, ConnectionError, asyncio.TimeoutError, TimeoutError, KeyboardInterrupt) as e:
-        print(f"❌ STOPPED: {type(e).__name__}: {e}", file=sys.stderr)
-        if isinstance(e, OperationalError): print("   Try deleting session file?", file=sys.stderr)
-        if isinstance(e, SessionPasswordNeededError): print("   Run interactively once?", file=sys.stderr)
-    except Exception as e: print(f"❌ UNEXPECTED CRITICAL ERROR: {e}"); import traceback; traceback.print_exc()
+        log.info("Connecting..."); await client.start(bot_token=BOT_TOKEN); log.info("Client connected.")
+        me = await client.get_me(); log.info("Logged in as: @%s (ID: %d)", me.username, me.id)
+        log.info("Starting bg ticker..."); ticker_task = asyncio.create_task(ticker()); ticker_task.set_name("ReminderTicker")
+        log.info("Bot running! Ctrl+C to stop."); await client.run_until_disconnected()
+    except Exception as e: log.critical("Main execution error: %s", e, exc_info=True)
     finally:
-        if client.is_connected(): print("\n🔌 Disconnecting..."); await client.disconnect()
-        print("🛑 Reminder Userbot stopped.")
+        log.info("Shutting down...");
+        if client.is_connected():
+             try: await client.disconnect()
+             except Exception as dc_e: log.error(f"Disconnect error: {dc_e}")
+             else: log.info("Client disconnected.")
+        if ticker_task and not ticker_task.done():
+            log.info("Cancelling ticker task..."); ticker_task.cancel()
+            try: await ticker_task
+            except asyncio.CancelledError: log.info("Ticker task cancelled.")
+            except Exception as task_e: log.error(f"Task shutdown error: {task_e}")
+        log.info("Shutdown complete.")
 
-if __name__ == "__main__": asyncio.run(main())
+def print_config():
+    print("-" * 60); log.info("CONFIG: API ID Set: %s", bool(API_ID)); log.info("CONFIG: API HASH Set: %s", bool(API_HASH)); log.info("CONFIG: Bot Token Set: %s", bool(BOT_TOKEN)); log.info("CONFIG: Timezone: %s", TZ_NAME); log.info("CONFIG: Allowed Chats: %s", ALLOWED_CHATS or "Any"); log.info("CONFIG: Reminder File: %s", REM_PATH); log.info("CONFIG: Media Dir: %s (Enabled: %s)", MEDIA_DIR, MEDIA_ENABLED); log.info("CONFIG: Check Interval: %ds", CHECK_SECS); print("-" * 60)
+
+if __name__ == "__main__":
+    if not os.access(ROOT, os.W_OK): log.warning("Script dir '%s' may not be writable.", ROOT)
+    try: asyncio.run(main())
+    except KeyboardInterrupt: log.info("Ctrl+C received, stopping.")
+    except Exception as e: log.critical("Unhandled exception: %s", e, exc_info=True); sys.exit(1)
+    sys.exit(0)
