@@ -93,13 +93,14 @@ A versatile Telegram bot that allows you to schedule and manage reminders easily
 
 4. **Run Manually**
     ```bash
+    sudo chown -R pi:pi .venv
     pip install python-dotenv
     pip install python-dateutil
     python3 -m pip install --upgrade telethon
     python TelegramReminder.py
     ```
 
-5. **Run as a Service (systemd)**
+6. **Run as a Service (systemd)**
     - Create `/etc/systemd/system/telegram_reminder.service` with content:
       ```ini
       [Unit]
@@ -126,7 +127,7 @@ A versatile Telegram bot that allows you to schedule and manage reminders easily
       journalctl -u telegram_reminder -f
       ```
 
-6. **Stopping Logs**  
+7. **Stopping Logs**  
    Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in your SSH/terminal to exit live log view.
 
 ---
